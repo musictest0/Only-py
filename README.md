@@ -1576,4 +1576,253 @@ class MyBot(BaseBot):
             if not self.skip_event.is_set():
                 if song_owner not in self.user_song_count:
                     self.user_song_count[song_owner] = 0
-         
+                self.user_song_count[song_owner] -= 1
+                await asyncio.sleep(10)
+                await self.play_next_song()
+            else:
+                self.skip_event.clear()
+        except Exception as e:
+            await self.highrise.chat(f"❌ An error occurred while playing the next song. Skipping to next.")
+            print(f"Error in play_next_song: {e}")
+            traceback.print_exc()
+            self.currently_playing = False
+            await asyncio.sleep(5)
+            await self.play_next_song()
+
+    async def convert_to_mp3(self, audio_file_path):
+        """Converte para MP3 apenas se necessário."""
+        try:
+            if audio_file_path.endswith('.mp3'):
+                return audio_file_path
+
+            mp3_file_path = audio_file_path.rsplit('.', 1)[0] + '.mp3'
+            if os.path.exists(mp3_file_path):
+                return mp3_file_path
+
+            subprocess.run([
+                'ffmpeg', '-y', '-i', audio_file_path,
+                '-acodec', 'libmp3lame', '-ab', '128k', '-ar', '44100', '-ac', '2', mp3_file_path
+            ], check=True)
+
+            return mp3_file_path
+        except Exception as e:
+            print(f"Erro ao converter para MP3: {e}")
+            return None
+
+    async def stream_to_radioking(self, mp3_file_path):
+        """Transmite o arquivo MP3 para o servidor RadioKing."""
+        icecast_server = "link.zeno.fm"
+
+        icecast_port = 80
+
+        mount_point = "/esjz5fvuzvwvv"
+
+        username = "source"
+
+        password = "VwU6gPr5"
+
+        icecast_url = f"icecast://{username}:{password}@{icecast_server}:{icecast_port}{mount_point}"
+        with ThreadPoolExecutor() as executor:
+            future = executor.submit(self._run_ffmpeg, mp3_file_path, icecast_url)
+            await asyncio.get_event_loop().run_in_executor(None, future.result)
+
+    def _run_ffmpeg(self, mp3_file_path, icecast_url):
+        """Executa o FFmpeg para transmissão."""
+        command = [
+            'ffmpeg', '-y', '-re', '-i', mp3_file_path,
+            '-f', 'mp3', '-acodec', 'libmp3lame', '-ab', '192k',
+            '-ar', '44100', '-ac', '2', '-reconnect', '1', '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '2', icecast_url
+        ]
+        try:
+            if self.ffmpeg_process:
+                self.ffmpeg_process.terminate()
+                self.ffmpeg_process.wait()
+                self.ffmpeg_process = None
+            self.ffmpeg_process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, stderr = self.ffmpeg_process.communicate()
+            if self.ffmpeg_process.returncode != 0:
+                raise RuntimeError(f"FFmpeg error: {stderr.decode('utf-8')}")
+        except Exception as e:
+            print(f"FFmpeg process error: {e}")
+
+    async def skip_song(self, user):
+        """Pula a música atual."""
+        if self.currently_playing:
+            if self.is_admin(user.username) or (self.current_song and self.current_song['owner'] == user.username):
+                async with asyncio.Lock():
+                    self.skip_event.set()
+                    if self.ffmpeg_process:
+                        self.ffmpeg_process.terminate()
+                        self.ffmpeg_process.wait()
+                        self.ffmpeg_process = None
+                    song_owner = self.current_song['owner']
+                    if song_owner in self.user_song_count:
+                        self.user_song_count[song_owner] -= 1
+                        if self.user_song_count[song_owner] <= 0:
+                            del self.user_song_count[song_owner]
+                    await self.highrise.chat(random.choice([
+                        f"⏭️ @{user.username} skipped the current song! Next one up! 🎶",
+                        f"⏭️ @{user.username} hit skip! Next song coming up! ✨",
+                        f"⏭️ Song skipped by @{user.username}! Let's play the next hit! 😎"
+                    ]))
+                    await asyncio.sleep(10)
+                    self.currently_playing = False
+                    await self.play_next_song()
+            else:
+                await self.highrise.chat(random.choice([
+                    "🔒 Only the song owner or an admin can skip! Try another command! 🎵",
+                    "🔒 Oops, only the owner or admin can skip the song! How about requesting a new one? ✨",
+                    "🔒 Only the owner or admin can skip! Use !play to pick a song! 😎"
+                ]))
+        else:
+            await self.highrise.chat(random.choice([
+                "🎵 No song to skip! Request one with -play! 🎶",
+                "🎵 Nothing playing to skip! Try -play to start! ✨",
+                "🎵 No song right now! How about a -play? 😎"
+            ]))
+
+    async def stop_existing_stream(self):
+        """Para qualquer transmissão ativa."""
+        if self.ffmpeg_process:
+            print("Stopping active stream...")
+            try:
+                self.ffmpeg_process.terminate()
+                await asyncio.sleep(1)
+                if self.ffmpeg_process.poll() is None:
+                    self.ffmpeg_process.kill()
+                print("Stream stopped successfully.")
+            except Exception as e:
+                print(f"Error stopping stream: {e}")
+            self.ffmpeg_process = None
+        else:
+            print("No active stream to stop.")
+
+    async def musicbot_dance(self):
+        """Faz o bot dançar enquanto há músicas na fila ou tocando."""
+        while True:
+            try:
+                if self.song_queue or self.currently_playing:
+                    await self.highrise.send_emote('dance-tiktok11', self.highrise.my_id)
+                    await asyncio.sleep(9.5)
+                else:
+                    await self.highrise.send_emote('emote-hello', self.highrise.my_id)
+                    await asyncio.sleep(2.7)
+            except Exception as e:
+                print(f"Error sending emote: {e}")
+
+    async def save_queue(self):
+        """Salva a fila de músicas no arquivo JSON."""
+        async with asyncio.Lock():
+            try:
+                with open('song_queue.json', 'w') as file:
+                    json.dump(self.song_queue, file)
+                await self.backup_file('song_queue.json')
+            except Exception as e:
+                print(f"Error saving queue: {e}")
+
+    def load_queue(self):
+        """Carrega a fila de músicas do arquivo JSON."""
+        try:
+            with open('song_queue.json', 'r') as file:
+                self.song_queue = json.load(file)
+                print("Song queue loaded from file.")
+        except FileNotFoundError:
+            self.song_queue = []
+        except Exception as e:
+            print(f"Error loading queue: {e}")
+
+    async def get_actual_pos(self, user_id):
+        """Obtém a posição atual de um usuário na sala."""
+        room_users = await self.highrise.get_room_users()
+        for user, position in room_users.content:
+            if user.id == user_id:
+                return position
+
+    def save_loc_data(self):
+        """Salva dados de localização do bot, incluindo direção."""
+        loc_data = {
+            'bot_position': {
+                'x': self.bot_pos.x,
+                'y': self.bot_pos.y,
+                'z': self.bot_pos.z,
+                'facing': self.bot_pos.facing  # 🆕 Added facing
+            } if self.bot_pos else None,
+            'ctoggle': self.ctoggle
+        }
+        with open('loc_data.json', 'w') as file:
+            json.dump(loc_data, file)
+
+    def load_loc_data(self):
+        """Carrega dados de localização do bot com direção."""
+        try:
+            with open('loc_data.json', 'r') as file:
+                loc_data = json.load(file)
+                pos_data = loc_data.get('bot_position')
+                if pos_data:
+                    self.bot_pos = Position(
+                        x=pos_data['x'],
+                        y=pos_data['y'],
+                        z=pos_data['z'],
+                        facing=pos_data.get('facing', 'Front')  # default 'Front' if missing
+                )
+                else:
+                    self.bot_pos = None
+                self.ctoggle = loc_data.get('ctoggle', False)
+        except FileNotFoundError:
+            pass
+
+    def save_current_song(self):
+        """Salva a música atual no arquivo JSON."""
+        with open("current_song.json", "w") as file:
+            json.dump(self.current_song, file)
+
+    def load_current_song(self):
+        """Carrega a música atual do arquivo JSON."""
+        try:
+            with open("current_song.json", "r") as file:
+                return json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    async def send_private_message(self, user: User, message: str) -> None:
+        """Send a private message to the user if they have a valid conversation_id in self.datas."""
+        if user.id in self.datas and "conversation_id" in self.datas[user.id]:
+            conversation_id = self.datas[user.id]["conversation_id"]
+            await self.highrise.send_message(conversation_id, message)
+        else:
+            await self.highrise.chat(
+            f"👋 Hey [{user.username}], I can't DM you yet! Please message me 'hi' in DM so I can reply properly. Then try again here!"
+        )
+
+    async def equip_item(self: BaseBot, user: User, message: str):
+        parts = message.strip().split(" ")
+        if len(parts) < 2:
+            await self.highrise.chat("❗ Please provide the item ID.")
+            return
+
+        item_id = parts[1]
+
+        try:
+        # Create the item directly
+            new_item = Item(
+            type="clothing",
+            amount=1,
+            id=item_id,
+            account_bound=False,
+            active_palette=0
+        )
+
+        # Remove conflicting items from the same category
+            outfit = (await self.highrise.get_my_outfit()).outfit
+            item_category = item_id.split("-")[0][0:4]
+            outfit = [item for item in outfit if item.id.split("-")[0][0:4] != item_category]
+
+            outfit.append(new_item)
+            await self.highrise.set_outfit(outfit)
+
+            await self.highrise.chat(f"✅ Equipped `{item_id}` successfully.")
+        except Exception as e:
+            await self.highrise.chat(f"⚠️ Failed to equip: {e}")
