@@ -1214,4 +1214,366 @@ class MyBot(BaseBot):
     # Send the full message in one whisper
         await self.send_private_message(user, msg)
 
-    
+    async def show_history(self, user: User):
+        """Exibe o histórico das últimas músicas tocadas."""
+        total_songs = len(self.history)
+        if total_songs == 0:
+            await self.highrise.send_whisper(user.id, random.choice([
+                "📜 We haven't played anything yet! Request a song with -play! 🎶",
+                "📜 History is empty! Let's vibe with -play! ✨",
+                "📜 No songs in history! Use -play to get started! 😎"
+            ]))
+            return
+        history_message = f"🎶 Last {min(total_songs, 15)} songs played:\n\n"
+        for index, song in enumerate(self.history[-15:][::-1], 1):
+            duration = song.get('duration', 0)
+            duration_minutes = int(duration // 60)
+            duration_seconds = int(duration % 60)
+            formatted_duration = f"{duration_minutes}:{duration_seconds:02d}"
+            dedication = f" (dedicated to @{song['dedicated_to']})" if song.get('dedicated_to') else ""
+            history_message += f"{index}. '{song['title']}' ({formatted_duration}) by @{song['owner']}{dedication} [{song['timestamp']}]\n"
+        for msg in await self.split_message(history_message):
+            await self.send_private_message(user, msg)
+            await asyncio.sleep(0.5)
+
+
+    async def add_to_queue(self, song_request, owner, dedicated_to=None):
+        """Adiciona uma música à fila."""
+        try:
+            await self.highrise.chat(random.choice([
+        "🔎 Searching for the perfect song for you... 🎵",
+        "🔎 Looking up your song with care... 🎶",
+        "🔎 Getting the next hit ready... Hang tight! ✨"
+    ]))
+        # 🔒 Check if song is banned before attempting to play
+            for banned_title in self.banned_titles:
+                if banned_title.lower() in song_request.lower():
+                    await self.highrise.chat(f"⛔ @{owner}, the song '{song_request}' is banned and cannot be played. Try another!")
+                    return
+
+            max_queue_limit = self.settings.get("queue_limit_per_user", 3)
+            if self.user_song_count.get(owner, 0) >= max_queue_limit:
+                await self.highrise.chat(random.choice([
+            f"🚫 @{owner}, you already have {max_queue_limit} songs in the queue! Wait for one to play! 🎶",
+            f"🚫 @{owner}, you've hit the limit of {max_queue_limit} requests! Hang tight! ✨",
+            f"🚫 @{owner}, that's {max_queue_limit} songs from you! Hold on, it'll play soon! 😎"
+        ]))
+                return
+
+            file_path, title, duration = await self.download_youtube_audio(song_request)
+            if file_path and title and duration:
+                if title.lower() in self.banned_titles:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    await self.highrise.chat(f"🚫 @{owner}, '{title}' is banned and cannot be played. Pick another song.")
+                    return
+                max_duration = self.settings.get("max_song_duration", 12) * 60
+                if duration > max_duration:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        print(f"File deleted: {file_path}")
+                    await self.highrise.chat(random.choice([
+                f"⏳ @{owner}, '{title}' exceeds {self.settings['max_song_duration']} minutes! Pick another? 🎵",
+                f"⏳ @{owner}, '{title}' is too long! Max is {self.settings['max_song_duration']} min. Try another! ✨",
+                f"⏳ @{owner}, '{title}' goes over the {self.settings['max_song_duration']} minute limit! Another song? 😎"
+            ]))
+                    return
+
+                if any(song['title'].lower() == title.lower() for song in self.song_queue):
+                    await self.highrise.chat(random.choice([
+                f"🔁 @{owner}, '{title}' is already in the queue! Try another song! 🎶",
+                f"🔁 @{owner}, '{title}' has already been requested! Pick a different song! ✨",
+                f"🔁 @{owner}, '{title}' is already on the list! How about another hit? 😎"
+            ]))
+                    return
+
+                if self.currently_playing_title and self.currently_playing_title.lower() == title.lower():
+                    await self.highrise.chat(random.choice([
+                f"🎧 @{owner}, '{title}' is playing now! Wait for it to finish! 🎵",
+                f"🎧 @{owner}, '{title}' is already on! Hold tight! ✨",
+                f"🎧 @{owner}, '{title}' is the current song! Try another later! 😎"
+            ]))
+                    return
+
+                song_data = {
+            'title': title,
+            'file_path': file_path,
+            'owner': owner,
+            'duration': duration
+        }
+                if dedicated_to:
+                    song_data['dedicated_to'] = dedicated_to
+
+                self.song_queue.append(song_data)
+                self.user_song_count[owner] = self.user_song_count.get(owner, 0) + 1
+
+                user_id = None
+                room_users = await self.highrise.get_room_users()
+                for room_user, _ in room_users.content:
+                    if room_user.username == owner:
+                        user_id = room_user.id
+                        break
+                if user_id:
+                    await self.update_rank(user_id)
+
+                await self.save_queue()
+
+                duration_minutes = int(duration // 60)
+                duration_seconds = int(duration % 60)
+                formatted_duration = f"{duration_minutes}:{duration_seconds:02d}"
+                queue_position = len(self.song_queue)
+
+                if dedicated_to:
+                    await self.highrise.chat(random.choice([
+                f"💖 A sweet dedication is on the way!\n🎵 Title: {title}\n⏱ Duration: {formatted_duration}\n📀 Queue: #{queue_position}\n🫶 From: @{owner} ➜ @{dedicated_to}\n🎶 Let the feelings flow!",
+                f"💝 Song Shared with Love!\n🎼 Track: {title}\n🕒 Length: {formatted_duration}\n📀 Queue Spot: #{queue_position}\n🎁 @{owner} ➝ @{dedicated_to}\n✨ That’s a vibe with meaning!",
+                f"🎁 Music Gift Incoming!\n🎵 Song: {title}\n🕓 Duration: {formatted_duration}\n📀 Position: #{queue_position}\n🎊 Dedicated by: @{owner} to @{dedicated_to}\n💕 Heartfelt moments ahead!",
+                f"🎧 A track from the heart!\n📜 Title: {title}\n⏳ Duration: {formatted_duration}\n📀 Queue: #{queue_position}\n💖 @{owner} dedicated this to @{dedicated_to}\n🎉 Turn it up with love!",
+                f"🎼 Special Dedication!\n🎵 Title: {title}\n⏱ Duration: {formatted_duration}\n📀 Queue No: #{queue_position}\n🤍 From: @{owner} to @{dedicated_to}\n🎊 Music with emotions attached!",
+                f"💞 @{owner} just made it special for @{dedicated_to}!\n🎶 Track: {title} • {formatted_duration}\n📀 Queue: #{queue_position}\n📨 Let the music speak the feelings!"
+            ]))
+                else:
+                    await self.highrise.chat(random.choice([
+                f"\n🎶 Now Queued!\n📜 Title: {title}\n⏱ Duration: {formatted_duration}\n📀 Queue: #{queue_position}\n🙋 Requested by: @{owner}\n✨ Get ready to vibe!",
+                f"\n🎵 Song Added to Queue!\n🎼 Title: {title}\n🕒 Length: {formatted_duration}\n📀 Position: #{queue_position}\n📣 Requested by: @{owner}\n🔥 Stay tuned!",
+                f"\n🎧 New Track in the Lineup!\n🎵 Title: {title}\n⏳ Time: {formatted_duration}\n📀 Queue No: #{queue_position}\n🧑‍🎤 Requested by: @{owner}\n🎉 Let's jam!",
+                f"\n🎼 Added to Playlist!\n📜 Track: {title}\n⏱ Duration: {formatted_duration}\n📀 Queue: #{queue_position}\n🔊 Requested by: @{owner}\n💓 Music is loading...",
+                f"\n📥 Incoming Song Request!\n🎶 Title: {title}\n🕘 Duration: {formatted_duration}\n📀 Spot: #{queue_position}\n🙋 From: @{owner}\n🚀 On its way to the speakers!",
+                f"\n🎤 You’re gonna love this one!\n🎵 Title: {title}\n🕓 Duration: {formatted_duration}\n📀 Queue Position: #{queue_position}\n🧍 Requested by: @{owner}\n🎊 Get ready to groove!"
+            ]))
+
+                if not self.currently_playing_title:
+                    await self.play_next_song()
+            else:
+                await self.highrise.chat(random.choice([
+            f"🚫 Couldn't find '{song_request}'! Try another song! 🎵",
+            f"🚫 Oops, '{song_request}' wasn't found! Pick another tune! ✨",
+            f"🚫 Hmm, '{song_request}' isn't available! Try a different hit! 😎"
+        ]))
+        except Exception as e:
+            await self.highrise.chat(f"❌ Something went wrong while adding the song. Try again!")
+            print(f"Error in add_to_queue: {e}")
+            traceback.print_exc()
+            
+    async def del_last_song(self, owner):
+        """Remove a última música do usuário da fila."""
+        last_song = None
+        for song in reversed(self.song_queue):
+            if song['owner'] == owner:
+                last_song = song
+                break
+        if last_song:
+            self.song_queue.remove(last_song)
+            self.user_song_count[owner] -= 1
+            await self.highrise.chat(random.choice([
+                f"🗑️ @{owner}, '{last_song['title']}' was removed from the queue! 🎶",
+                f"🗑️ @{owner}, your song '{last_song['title']}' is out of the list! ✨",
+                f"🗑️ @{owner}, I removed '{last_song['title']}' from the queue for you! 😎"
+            ]))
+            await self.save_queue()
+        else:
+            await self.highrise.chat(random.choice([
+                f"😕 @{owner}, you don't have any songs in the queue! Try -play! 🎵",
+                f"😕 @{owner}, no songs from you in the queue! Want to request one? ✨",
+                f"😕 @{owner}, your queue is empty! Use !play to add a song! 😎"
+            ]))
+
+    async def clear_queue(self):
+        """Limpa a fila de músicas e remove arquivos baixados."""
+        self.song_queue.clear()
+        self.user_song_count.clear()
+        downloaded_files = glob.glob('downloads/*')
+        for file in downloaded_files:
+            try:
+                os.remove(file)
+                print(f"File deleted: {file}")
+            except Exception as e:
+                print(f"Error deleting file {file}: {e}")
+        await self.save_queue()
+        await self.highrise.chat(random.choice([
+            "🗑️ Queue cleared and files removed! Ready to start fresh? 🎶",
+            "🗑️ Emptied the queue and files! Ready for new songs? ✨",
+            "🗑️ All clear! Queue empty, let's request some songs! 😎"
+        ]))
+
+    async def download_youtube_audio(self, song_request):
+        """Baixa o áudio de uma música do YouTube com yt-dlp e retorna MP3 compatível."""
+        try:
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'outtmpl': 'downloads/%(id)s.%(ext)s',
+                'default_search': 'ytsearch',
+                'quiet': True,
+                'noplaylist': True,
+                'cookiefile': 'cookies.txt',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '128',
+                }],
+            }
+
+            with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(song_request, download=True)
+                if 'entries' in info:
+                    info = info['entries'][0]
+                video_id = info['id']
+                title = info['title']
+                duration = info['duration']
+                file_path = f"downloads/{video_id}.mp3"
+
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(f"Arquivo MP3 não encontrado: {file_path}")
+
+                print(f"Downloaded: {file_path} with title: {title}, duration: {duration} seconds")
+                return file_path, title, duration
+
+        except Exception as e:
+            print(f"Error downloading song: {e}")
+            await self.highrise.chat(random.choice([
+                f"🚫 Erro ao baixar '{song_request}'! Tente outra música! 🎵",
+                f"🚫 Não consegui encontrar '{song_request}'! Escolha outro hit! ✨"
+            ]))
+            return None, None, None
+
+    async def now_playing(self, user: User):
+        """Exibe informações sobre a música que está tocando."""
+        if self.current_song is None:
+            await self.highrise.send_whisper(user.id, random.choice([
+                "🎵 Nothing's playing now! Request a song with !play! 🎶",
+                "🎵 It's quiet in here! How about picking a tune with !play? ✨",
+                "🎵 No song playing! Use !play to liven up the room! 😎"
+            ]))
+            return
+        if self.currently_playing_title:
+            current_song = self.current_song
+            total_duration = current_song.get('duration', 0)
+            adjusted_total_duration = total_duration
+            delay_threshold = 20
+            elapsed_time = time.time() - self.song_start_time
+            if elapsed_time < delay_threshold:
+                elapsed_time = 0
+            else:
+                elapsed_time -= delay_threshold
+            elapsed_time = min(elapsed_time, adjusted_total_duration)
+            progress_percentage = (elapsed_time / adjusted_total_duration) * 100
+            progress_bar_length = 10
+            filled_length = int(progress_percentage / (100 / progress_bar_length))
+            progress_bar = '█' * filled_length
+            empty_bar = '▒' * (progress_bar_length - filled_length)
+            progress_bar_display = f"[{progress_bar}{empty_bar}]"
+            total_duration_str = f"{int(adjusted_total_duration // 60)}:{int(adjusted_total_duration % 60):02d}"
+            elapsed_time_str = f"{int(elapsed_time // 60)}:{int(elapsed_time % 60):02d}"
+            dedication = f" (dedicated to @{current_song['dedicated_to']})" if current_song.get('dedicated_to') else ""
+            message = random.choice([
+                f"🎶 Now playing: '{self.currently_playing_title}'\n\n{elapsed_time_str} {progress_bar_display} {total_duration_str}\nBy @{current_song['owner']}{dedication} 🎵",
+                f"🎶 On air: '{self.currently_playing_title}'\n\n{elapsed_time_str} {progress_bar_display} {total_duration_str}\nRequested by @{current_song['owner']}{dedication} ✨",
+                f"🎶 Vibe: '{self.currently_playing_title}'\n\n{elapsed_time_str} {progress_bar_display} {total_duration_str}\nChosen by @{current_song['owner']}{dedication} 😎"
+            ])
+            for msg in await self.split_message(message):
+                await self.highrise.send_whisper(user.id, msg)
+                await asyncio.sleep(0.5)
+        else:
+            await self.highrise.send_whisper(user.id, random.choice([
+                "🎵 Nothing's playing now! Request a song with -play! 🎶",
+                "🎵 It's quiet in here! How about picking a tune with -play? ✨",
+                "🎵 No song playing! Use -play to liven up the room! 😎"
+            ]))
+
+    async def play_next_song(self):
+        """Toca a próxima música da fila."""
+        try:
+            self.skip_event.clear()
+            await asyncio.sleep(2)
+            if not self.song_queue:
+                self.currently_playing = False
+                self.currently_playing_title = None
+                await self.highrise.chat(random.choice([
+                "📭 The queue is empty! Who's got the next song? 🎶",
+                "📭 No songs in the queue! Use -play to keep the vibe going! ✨",
+                "📭 Queue is clear! Let's grab a song with -play! 😎"
+            ]))
+                return
+            if self.currently_playing:
+                print("A song is already playing. Avoiding starting a new one.")
+                return
+            next_song = self.song_queue.pop(0)
+            await self.save_queue()
+            self.current_song = next_song
+            self.save_current_song()
+            self.currently_playing = True
+            self.currently_playing_title = next_song['title']
+            song_title = next_song['title']
+            song_owner = next_song['owner']
+            dedicated_to = next_song.get('dedicated_to')
+            file_path = next_song['file_path']
+            self.song_start_time = time.time()
+            duration = next_song.get('duration', 0)
+            duration_minutes = int(duration // 60)
+            duration_seconds = int(duration % 60)
+            formatted_duration = f"{duration_minutes}:{duration_seconds:02d}"
+        
+        # Get listener count using tuple unpacking
+            room_users = await self.highrise.get_room_users()
+            listener_count = len(room_users.content)
+            dedication_text = f"🎁 Dedicated by @{song_owner} ➜ @{dedicated_to}" if dedicated_to else f"🙋 Requested by: @{song_owner}"
+        
+            await self.highrise.chat(random.choice([
+        f"\n🎵 Now Playing! 🎵\n📜 Title: {song_title}\n⏱ Duration: {formatted_duration}\n{dedication_text}\n👥 Total listeners: {listener_count}",
+        f"\n🎶 Current Track 🎶\n🎼 Title: {song_title}\n🕒 Time: {formatted_duration}\n{dedication_text}\n👂 Listeners in room: {listener_count}",
+        f"\n🎧 You're listening to:\n🎵 {song_title} • {formatted_duration}\n{dedication_text}\n👥 Vibe shared with {listener_count} people!"
+    ]))
+            print(f"Playing: {song_title}")
+            history_entry = {
+            'title': song_title,
+            'owner': song_owner,
+            'duration': duration,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+            if dedicated_to:
+                history_entry['dedicated_to'] = dedicated_to
+            self.history.append(history_entry)
+            await self.save_history()
+            mp3_file_path = await self.convert_to_mp3(file_path)
+            if not mp3_file_path:
+                await self.highrise.chat(random.choice([
+                "⏳ Processing the song, one moment please... 🎵",
+                "⏳ Preparing the song, just a second! ✨",
+                "⏳ Loading the hit, hold on a moment! 😎"
+            ]))
+                new_file_path, new_title, new_duration = await self.download_youtube_audio(song_title)
+                if new_file_path:
+                    mp3_file_path = await self.convert_to_mp3(new_file_path)
+                    if not mp3_file_path:
+                        await self.highrise.chat(random.choice([
+                        "🚫 Couldn't process the song! Moving to the next one! 🎶",
+                        "🚫 Oops, the song failed! Next song coming up! ✨",
+                        "🚫 Yikes, the song got stuck! On to the next hit! 😎"
+                    ]))
+                        self.currently_playing = False
+                        await asyncio.sleep(10)
+                        await self.play_next_song()
+                        return
+                    else:
+                        file_path = new_file_path
+                else:
+                    await self.highrise.chat(random.choice([
+                    "🚫 Failed to download! Moving to the next song! 🎶",
+                    "🚫 Couldn't load! Next track coming up! ✨",
+                    "🚫 Song not found! Let's go to the next hit! 😎"
+                ]))
+                    self.currently_playing = False
+                    await asyncio.sleep(10)
+                    await self.play_next_song()
+                    return
+            await self.stream_to_radioking(mp3_file_path)
+            if os.path.exists(mp3_file_path):
+                os.remove(mp3_file_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            self.currently_playing = False
+            self.current_song = None
+            if not self.skip_event.is_set():
+                if song_owner not in self.user_song_count:
+                    self.user_song_count[song_owner] = 0
+         
