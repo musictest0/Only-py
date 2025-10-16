@@ -897,4 +897,321 @@ class MyBot(BaseBot):
                 message_chunks.append(chunk.strip())
 
             for msg in message_chunks:
-                await self.send_private_mes
+                await self.send_private_message(user, msg)
+
+        elif message.strip() == "-banlist" and self.is_admin(user.username):
+            if not self.banned_titles:
+                await self.highrise.chat("📭 No songs are currently banned.")
+                return
+
+            banned_list = list(self.banned_titles)
+            items_per_page = 10
+            total = len(banned_list)
+            pages = (total + items_per_page - 1) // items_per_page
+
+            for page in range(pages):
+                start = page * items_per_page
+                end = start + items_per_page
+                chunk = banned_list[start:end]
+                chunk_text = "\n".join([f"{i+1}. {title}" for i, title in enumerate(chunk, start=start)])
+
+                await self.send_private_message(user, f"🚫 Banned Songs ({start+1}-{min(end, total)} of {total}):\n{chunk_text}")
+                await asyncio.sleep(1.5)
+
+        elif message.startswith("-ban ") and self.is_admin(user.username):
+    # Only allow -ban with a space, so it doesn't overlap with -banlist
+            try:
+                if not self.current_song:
+                    await self.highrise.chat(f"🎵 @{user.username}, no song is currently playing to ban!")
+                    return
+
+                banned_title = self.current_song["title"].strip().lower()
+
+                if banned_title in self.banned_titles:
+                    await self.highrise.chat(f"🚫 @{user.username}, '{self.current_song['title']}' is already banned.")
+                    return
+
+                self.banned_titles.add(banned_title)
+                self.save_banned_songs()
+                await self.highrise.chat(f"🚫 [@{user.username}], BANNED '{self.current_song['title']}' from being played again!")
+                # 🔄 Auto-skip just like -skip command
+                await self.skip_song(user)  # ← Reuses your existing skip logic
+            except Exception as e:
+                await self.highrise.chat(f"⚠️ Ban failed: {e}")
+                
+        elif message.startswith("-unban ") and self.is_admin(user.username):
+            parts = message.split(" ", 1)
+            if len(parts) < 2 or not parts[1].isdigit():
+                await self.highrise.chat("⚠️ Use: -unban <number>. Check list with -banlist")
+                return
+
+            index = int(parts[1]) - 1
+            banned_list = list(self.banned_titles)
+
+            if index < 0 or index >= len(banned_list):
+                await self.highrise.chat("❌ Invalid unban number.")
+                return
+
+            removed = banned_list.pop(index)
+            self.banned_titles = set(banned_list)  # update the set
+            self.save_banned_songs()
+            await self.highrise.send_whisper(user.id, f"✅ Unbanned: '{removed}'")
+        
+        elif message.startswith('-skip'):
+            await self.skip_song(user)
+
+        elif message.startswith('-delq'):
+            parts = message.split()
+            if len(parts) == 1:
+                await self.del_last_song(user.username)
+
+        elif message.startswith('-clearq') and self.is_admin(user.username):
+            parts = message.split()
+            if len(parts) == 1:
+                await self.clear_queue()
+
+        elif message.startswith('-q'):
+            await self.check_queue(user)
+            
+        elif message.startswith('-np'):
+            await self.now_playing(user)
+
+        elif message.startswith('-history'):
+            await self.show_history(user)
+
+        elif message.startswith('-rank'):
+            if not self.ranks:
+                await self.highrise.chat(random.choice([
+                    "🏆 No rankings yet! Request some songs to get on the list! 🎵",
+                    "🏆 No rankings available! Let's play some music to build the list! ✨",
+                    "🏆 Rankings are empty for now! Play a song and join the game! 😎"
+                ]))
+                return
+            user_ids = list(self.ranks.keys())
+            usernames = await self.get_user_details(user_ids)
+            ranking = []
+            for uid in user_ids:
+                if usernames.get(uid):
+                    song_count = self.ranks[uid].get("song_count", 0)
+                    ranking.append((uid, usernames[uid], song_count))
+            ranking.sort(key=lambda x: (-x[2], x[1].lower()))
+            top_5 = ranking[:5]
+            leaderboard_message = "🏆 Top DJs of MJBots! 🎧\n\n"
+            for index, (_, username, song_count) in enumerate(top_5, 1):
+                leaderboard_message += f"{index}. @{username}: {song_count} songs 🎶\n"
+            user_position = None
+            user_song_count = self.ranks.get(user_id, {"song_count": 0})["song_count"]
+            for index, (uid, username, song_count) in enumerate(ranking, 1):
+                if uid == user_id:
+                    user_position = index
+                    break
+            if user_position:
+                leaderboard_message += f"\n📍 You're in {user_position}th place with {user_song_count} songs! 🚀"
+            else:
+                leaderboard_message += "\n📍 You haven't requested any songs yet. Want to join the ranking? 🎵"
+            for msg in await self.split_message(leaderboard_message):
+                await self.send_private_message(user, msg)
+                await asyncio.sleep(0.5)
+
+        else:
+            try:
+                await handle_economy_admin_commands(self, user, message)
+            except Exception as e:
+                print(f"Error executing handle_economy_admin_commands: {e}")
+                await self.highrise.chat(random.choice([
+                    "🚫 Oops, something went wrong with the command! Try again! 🎵",
+                    "🚫 Yikes, the command failed! Can you try again? ✨",
+                    "🚫 Hmm, that command didn't work! Give it another shot! 😎"
+                ]))
+
+    async def on_message(self, user_id: str, conversation_id: str, is_new_conversation: bool) -> None:
+        """Handles private messages (DMs)."""
+        try:
+            # Check if user is already saved
+            if user_id in self.datas:
+                saved_convo_id = self.datas[user_id].get("conversation_id", None)
+                if saved_convo_id != conversation_id:
+                    # Update only if conversation_id is different
+                    print(f"🔄 Updating conversation ID for {self.datas[user_id]['username']} from {saved_convo_id} → {conversation_id}")
+                    self.datas[user_id]["conversation_id"] = conversation_id
+                    self.save_datas()
+                    print(f"✅ Successfully updated conversation ID.")
+            else:
+                # If user is not saved, proceed to get their message and save them
+                response = await self.highrise.get_messages(conversation_id)
+                print(f"Received response: {response}")
+
+                if isinstance(response, GetMessagesRequest.GetMessagesResponse) and response.messages:
+                    message = response.messages[0].content
+                    print(f"Received message: {message}")
+
+                    user_response = await self.webapi.get_user(user_id)
+                    if hasattr(user_response, 'user'):
+                        username = user_response.user.username
+                        print(f"👤 New user detected: {username} (ID: {user_id})")
+
+                        # Save new user
+                        self.datas[user_id] = {
+                            "username": username,
+                            "conversation_id": conversation_id,
+                            "subscribe": True
+                        }
+                        self.save_datas()
+                        print(f"✅ New user saved with conversation ID.")
+
+                        # Send welcome message
+                        welcome_msg = (
+                            f"🎉 Welcome, [{username}]! Your profile is now set up.\n\n"
+                            "🚀 You now have access to all commands. Type `!help` in room chat to get started!"
+                        )
+                        await self.highrise.send_message(conversation_id, welcome_msg)
+
+            # Handle commands
+            response = await self.highrise.get_messages(conversation_id)
+            if isinstance(response, GetMessagesRequest.GetMessagesResponse):
+                message = response.messages[0].content.lower().strip()
+            else:
+                return
+
+            if message.startswith('-play '):
+                if self.is_loading:
+                    await self.highrise.send_message(conversation_id, random.choice([
+                        "🎵 Hold on, I'm getting the sound ready! Try again soon! 🔄",
+                        "🎵 Loading the vibe, just a moment! Try again in a bit! ✨",
+                        "🎵 Tuning the speakers! Wait a second and try again! 🎶"
+                    ]))
+                    return
+
+                if user_id in self.blocked_users:
+                    await self.highrise.send_message(conversation_id, random.choice([
+                        "🚫 You're blocked from song requests! Contact an admin! 😢",
+                        "🚫 Song requests are blocked for you! Reach out to an admin! 🎵",
+                        "🚫 You can't request songs now! Talk to the admins! ✨"
+                    ]))
+                    return
+
+                username = (await self.get_user_details([user_id])).get(user_id)
+                if not username:
+                    await self.highrise.send_message(conversation_id, random.choice([
+                        "😕 Couldn't find your name! Try in the room chat! 🎶",
+                        "😕 Oops, your name didn't show up! Please use the room chat! ✨",
+                        "😕 Hmm, couldn't find your user! Try in the main chat! 😎"
+                    ]))
+                    return
+
+                song_request = message[len('-play '):].strip()
+                if self.user_song_count.get(username, 0) >= self.settings["queue_limit_per_user"]:
+                    await self.highrise.send_message(conversation_id, random.choice([
+                        f"🚧 @{username}, you already have {self.settings['queue_limit_per_user']} songs in the queue! Wait for one to play! 🎶",
+                        f"🚧 @{username}, you've hit the limit of {self.settings['queue_limit_per_user']} songs! Hang tight! ✨",
+                        f"🚧 @{username}, that's {self.settings['queue_limit_per_user']} requests from you! Hold on, it'll play soon! 😎"
+                    ]))
+                    return
+
+                if self.ctoggle and not self.is_vip(user_id):
+                    play_cost = self.settings.get("play_cost", 5)
+                    user_balance = await self.get_user_balance(user_id)
+                    if user_balance < play_cost:
+                        await self.highrise.send_message(conversation_id, random.choice([
+                            f"💸 You need {play_cost} gold to play! Balance: {user_balance}. Try -daily or donate! 🎵",
+                            f"💸 You're short {play_cost} gold! Balance: {user_balance}. Use -daily or support the bot! ✨",
+                            f"💸 Your {user_balance} gold doesn't cover the {play_cost} needed! Try -daily! 😎"
+                        ]))
+                        return
+
+                    await self.highrise.send_message(conversation_id, random.choice([
+                        "🎶 Use -play in the room chat to pay with gold! Let's go! 😎",
+                        "🎶 In the room chat, use !play to spend your gold! Play that song! ✨",
+                        "🎶 To pay with gold, type !play in the main chat! Ready? 🎵"
+                    ]))
+                    return
+
+                await self.add_to_queue(song_request, username)
+                await self.highrise.send_message(conversation_id, random.choice([
+                    f"🎵 Nice one, @{username}! '{song_request}' has been added to the queue! 🎉",
+                    f"🎵 @{username}, '{song_request}' is in the queue! Let's vibe! ✨",
+                    f"🎵 Great choice, @{username}! '{song_request}' is on the list! 😎"
+                ]))
+            else:
+                await self.highrise.send_message(conversation_id, random.choice([
+                    "🎵 Use commands in the room chat or type -play <song> here! 📬",
+                    "🎵 Room chat is best for commands! Try -play <song> in DMs! ✨",
+                    "🎵 Main chat is better for commands! Use -play <song> here! 😎"
+                ]))
+        except Exception as e:
+            print(f"❌ Error in on_message: {e}")
+
+    async def on_tip(self, sender: User, receiver: User, tip: CurrencyItem | Item) -> None:
+        """Gerencia doações (tips) recebidas pelo bot."""
+        if isinstance(tip, CurrencyItem) and receiver.id == self.highrise.my_id:
+            await self.update_user_balance(sender.id, tip.amount)
+            status = " (VIP 🎖️)" if self.is_vip(sender.id) else ""
+            await self.highrise.chat(random.choice([
+                f"💸 Thanks, @{sender.username}{status}! You donated {tip.amount} gold! Balance: {await self.get_user_balance(sender.id)} gold! 🎵",
+                f"💸 @{sender.username}{status}, appreciate the {tip.amount} gold! Your balance now: {await self.get_user_balance(sender.id)} gold! ✨",
+                f"💸 Awesome, @{sender.username}{status}! You gave {tip.amount} gold! Current balance: {await self.get_user_balance(sender.id)} gold! 😎"
+            ]))
+
+    async def process_play_payment(self, user: User, play_cost: int):
+        """Processa o pagamento para tocar uma música."""
+        if self.is_vip(user.id):
+            await self.highrise.chat(random.choice([
+                f"🎖️ @{user.username}, as a VIP, your song is on us! Play that tune! 🎶",
+                f"🎖️ @{user.username}, VIPs play for free! Pick your song and let's go! ✨",
+                f"🎖️ @{user.username}, free songs for VIPs! What's next? 😎"
+            ]))
+            return
+        try:
+            await self.update_user_balance(user.id, -play_cost)
+            await self.update_user_balance(self.highrise.my_id, play_cost)
+            new_balance = await self.get_user_balance(user.id)
+            await self.highrise.chat(random.choice([
+                f"💸 @{user.username}, you paid {play_cost} gold for the song! Balance: {new_balance} gold. Let's enjoy it! 🎵",
+                f"💸 @{user.username}, {play_cost} gold paid! Your balance is {new_balance} gold. Play that track! ✨",
+                f"💸 @{user.username}, song unlocked for {play_cost} gold! Current balance: {new_balance} gold! 😎"
+            ]))
+        except Exception as e:
+            print(f"Error processing payment: {e}")
+            await self.highrise.chat(random.choice([
+                "🚫 Oops, something went wrong with the payment! Try again! 🎵",
+                "🚫 Yikes, the payment failed! Can you try again? ✨",
+                "🚫 Hmm, couldn't process the gold! Give it another shot! 😎"
+            ]))
+
+    async def check_queue(self, user: User):
+        """Displays a premium, styled song queue (top 10)."""
+        total_songs = len(self.song_queue)
+        top_limit = 10
+
+        if total_songs == 0:
+            await self.highrise.send_whisper(user.id, random.choice([
+            "🌌 The music galaxy is silent... Add your favorite track with `-play` ✨",
+            "🪐 No tracks yet! Type `-play` and let the rhythm begin 🎶",
+            "🥱 It's quiet here... Queue up a vibe using `-play`!"
+        ]))
+            return
+
+        track_word = "Track" if total_songs == 1 else "Tracks"
+        msg = f"""✨ Your Music Lounge ✨  
+🎼 Total {total_songs} {track_word} in queue  
+━━━━━━━━━━━━━━━━━━━\n"""
+
+        music_emojis = ["🎵", "🎶", "🎧", "🎼", "🎷", "🎺", "🎸", "🪕", "🎻", "📻"]
+
+        for idx, song in enumerate(self.song_queue[:top_limit], start=1):
+            title = song.get("title", "Unknown Title")
+            owner = song.get("owner", "Unknown")
+            dedicated = f" 💖 for @{song['dedicated_to']}" if song.get("dedicated_to") else ""
+            emoji = music_emojis[(idx - 1) % len(music_emojis)]
+
+            msg += (
+            f"\n{emoji} {idx}. {title}\n"
+            f"   ↳ 🙋 Requested by @{owner}{dedicated}\n"
+        )
+
+        msg += "\n━━━━━━━━━━━━━━━━━━━\n💡 Use `-play` to add more tracks!"
+
+    # Send the full message in one whisper
+        await self.send_private_message(user, msg)
+
+    
