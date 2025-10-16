@@ -464,4 +464,437 @@ class MyBot(BaseBot):
 
             self.load_loc_data()
             if self.bot_pos:
-                await self.highrise.
+                await self.highrise.teleport(self.highrise.my_id, self.bot_pos)
+
+            await self.stop_existing_stream()
+            await asyncio.sleep(5)
+
+            self.skip_event.clear()
+            self.load_queue()
+            self.current_song = self.load_current_song()
+
+            if self.current_song:
+                await self.highrise.chat(random.choice([
+                f"🔄 Back with the vibe: '{self.current_song['title']}'! Let's enjoy it! 🎶",
+                f"🔄 Resuming '{self.current_song['title']}'! Ready for the beat? 🎵",
+                f"🔄 Continuing with '{self.current_song['title']}'! Time to dance! ✨"
+            ]))
+                self.song_queue.insert(0, self.current_song)
+                await asyncio.sleep(10)
+
+            self.is_loading = False
+
+            await self.highrise.chat(random.choice([
+            "🎉 All set! Use -help to see my commands and start the party! 😎",
+            "🎵 Music on! Type -help for commands and let's have fun! 🕺",
+            "🚀 MJBots is online! Check commands with -help and play some tunes! 🎧"
+        ]))
+
+            if self.song_queue:
+                print("Resuming playback of queued songs...")
+                await self.play_next_song()
+
+        # Start background tasks
+            self.background_tasks = [
+            asyncio.create_task(self.backup_task()),
+           # asyncio.create_task(self.emote_loop())
+        ]
+
+        except Exception as e:
+            print(f"❌ [on_start] Error: {e}")
+            if "closing transport" in str(e).lower():
+                print("🔁 Highrise disconnected at startup. Restarting bot...")
+                await self.shutdown_tasks()
+                raise SystemExit(1)  # Triggers restart from main.py
+            raise
+
+    async def shutdown_tasks(self):
+        print("🧹 Shutting down all background tasks...")
+        for task in getattr(self, "background_tasks", []):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    print(f"✅ Task {task.get_coro().__name__} cancelled.")
+        self.background_tasks.clear()
+
+    
+    async def emote_loop(self):
+        """Continuously sends random emotes based on duration from emote_dict.json"""
+        while True:
+            try:
+                if not self.emote_data:
+                    print("No emotes loaded.")
+                    await asyncio.sleep(10)
+                    continue
+
+                # Pick a random emote
+                emote_info = random.choice(list(self.emote_data.values()))
+                emote_id = emote_info.get("id")
+                duration = emote_info.get("duration", 5)  # default 5s if missing
+
+                if emote_id:
+                    await self.highrise.send_emote(emote_id)
+                    print(f"[EMOTE] Sent {emote_info.get('name')} ({emote_id})")
+                    await asyncio.sleep(duration + 2)
+                else:
+                    print("Invalid emote data, skipping.")
+                    await asyncio.sleep(3)
+
+            except Exception as e:
+                print(f"[emote_loop error]: {e}")
+                await asyncio.sleep(5)
+
+    
+    def is_admin(self, username):
+        """Verifica se o usuário é administrador."""
+        return username in self.admins
+
+    async def split_message(self, message: str, max_length: int = 250) -> list:
+        """Divide mensagens longas em partes menores."""
+        if len(message) <= max_length:
+            return [message]
+        messages = []
+        current = ""
+        for line in message.split("\n"):
+            if len(current) + len(line) + 1 <= max_length:
+                current += line + "\n"
+            else:
+                if current:
+                    messages.append(current.strip())
+                current = line + "\n"
+        if current:
+            messages.append(current.strip())
+        return messages
+
+    async def get_user_details(self, user_ids: list) -> dict:
+        """Obtém detalhes dos usuários, utilizando cache para otimizar."""
+        result = {}
+        uncached_ids = [uid for uid in user_ids if uid not in self.username_cache]
+        if uncached_ids:
+            for uid in uncached_ids:
+                try:
+                    response = await self.webapi.get_user(uid)
+                    if response.user:
+                        self.username_cache[uid] = response.user.username
+                    else:
+                        self.username_cache[uid] = None
+                except Exception as e:
+                    print(f"Error fetching user details for {uid}: {str(e)}")
+                    self.username_cache[uid] = None
+        for uid in user_ids:
+            result[uid] = self.username_cache.get(uid)
+        return result
+
+    async def on_chat(self, user: User, message: str) -> None:
+        """Gerencia mensagens no chat da sala."""
+        #message = message.lower().strip()
+        user_id = user.id
+
+        if message.startswith("-") and user.id not in self.datas:
+            await self.highrise.send_whisper(
+    user.id,
+    f"\n✨ Hello [{user.username}], it looks like your profile setup is incomplete.\n\n"
+    "📩 To get started, please send `hi` to [@Bot_agent] in DM and complete your profile setup.\n"
+    f"🔁 Once done, you can try `{message}` again to access all features."
+            )
+            return
+
+        if message.startswith("-equip"):
+            await self.equip_item(user, message)
+
+        if message.startswith("-item "):
+            parts = message.strip().split(" ", 1)
+            if len(parts) < 2:
+                await self.highrise.chat("Invalid command")
+                return
+
+            item_name = parts[1].strip()
+            print(f"Searching item: {item_name}")
+
+            try:
+                response = await self.webapi.get_items(item_name=item_name)
+                print(response)
+
+                if not response.items:
+                    await self.highrise.chat(f"No item found: {item_name}")
+                    return
+
+                item = response.items[0]
+                name = item.item_name
+                item_id = item.item_id
+                category = item.category.value
+                rarity = item.rarity.value if item.rarity else "Unknown"
+                pops_price = item.pops_sale_price if item.pops_sale_price is not None else "N/A"
+                tradable = "✅" if item.is_tradable else "❌"
+                purchasable = "✅" if item.is_purchasable else "❌"
+
+                first_id = response.first_id
+                last_id = response.last_id
+
+                msg = (
+            f"🎭 [{name}] -- (ID: {item_id})\n"
+            f"📦 Category: {category}\n"
+            f"🌟 Rarity: {rarity}\n"
+            f"💰 Pops Price: {pops_price}\n"
+            f"🔗 Tradable: {tradable} | 🛒 Purchasable: {purchasable}\n"
+            f"📄 First ID: {first_id}\n"
+            f"📄 Last ID: {last_id}"
+        )
+                await self.send_private_message(user, msg)
+
+            except Exception as e:
+                await self.highrise.chat(f"Error in item: {e}")
+
+        # Gerencia confirmação de VIP
+        if message.startswith('-confirm vip '):
+            if user_id in self.pending_confirmations:
+                response = message[len('-confirm vip '):].strip()
+                if response in ['yes', 'y', 'no', 'n']:
+                    await handle_vip_confirmation(self, user_id, None, response)
+                else:
+                    await self.highrise.chat(random.choice([
+                        f"🚫 @{user.username}, use -confirm vip yes or -confirm vip no! 📜",
+                        f"🚫 @{user.username}, invalid response! Try -confirm vip yes/no! ✨",
+                        f"🚫 @{user.username}, wrong command! Use -confirm vip yes or no! 😎"
+                    ]))
+            else:
+                await self.highrise.chat(random.choice([
+                    f"🚫 @{user.username}, no pending VIP purchase! Use -buy vip first! 📜",
+                    f"🚫 @{user.username}, nothing to confirm! Try -buy vip! ✨",
+                    f"🚫 @{user.username}, no VIP request pending! Start with -buy vip! 😎"
+                ]))
+            return
+
+        if message == '-fit 1' and self.is_admin(user.username):
+            self.outfit = self.get_default_outfit()
+            await self.apply_outfit()
+            await self.save_outfit()
+            self.log_command("fit", user_id, "Applied default outfit")
+            await self.highrise.chat(random.choice([
+        f"👗 @{user.username}, MJBots is rocking a new look! Default style on point! ✨",
+        f"👗 @{user.username}, default outfit activated! MJBots looks stylish! 🎵",
+        f"👗 @{user.username}, default style applied! Pure elegance! 😎"
+    ]))
+            return
+
+        if message == '-help':
+            help_message = (
+        "🎵 Welcome to MJBots, your virtual DJ! Check out the available commands: 🎶\n\n"
+        "🎧 -help music     - Commands to pick and enjoy music\n"
+        "💰 -help economy   - Manage your gold and VIP status\n"
+        "🔧 -help admin     - Exclusive functions for admins\n\n"
+        "✨ Quick commands:\n"
+        "  💸 -balance - Check your gold balance\n"
+        "  📜 -profile - View your level and requested songs\n"
+        "  🎁 -daily   - Earn free gold daily\n\n"
+        "🔥 Type -help <category> for more details and let's party! 🎉"
+    )
+            for msg in await self.split_message(help_message):
+                await self.send_private_message(user, msg)
+                await asyncio.sleep(0.5)
+                
+        elif message == '-help music':
+            music_help_message = (
+    "🎶 Commands to liven up the room with music! 🎵\n\n"
+    "🎸 -play <song>              - Choose a song to play\n"
+    "   Ex.: -play Bohemian Rhapsody\n"
+    "🎁 -play @user <song>     - Dedicate a song to someone\n"
+    "   Ex.: -play @Friend Happy Birthday\n"
+    f"   Cost: {self.settings['play_cost']} gold (free for VIPs)\n\n"
+    "⏭️ -skip                    - Skip the current song (owner or admin)\n"
+    "🗑️ -delq                    - Remove your last song from the queue\n"
+    "📋 -q                       - View the song queue\n"
+    "   Ex.: -q 2 (for page 2)\n"
+    "🎧 -np                      - See the currently playing song\n"
+    "📜 -history                 - View the last 15 played songs\n"
+    "🏆 -rank                    - Check the request ranking\n\n"
+    "💖 Favorites System:\n"
+    "⭐ -fav                     - Add current song to your favorites\n"
+    "📂 -my fav                  - View your favorite songs list\n"
+    "▶️ -playfav [number]          - Play a song from your favorites\n"
+    "❌ -removefav [number]        - Remove a song from your favorites\n"
+    f"   Limit: 20 songs (VIPs: 40 songs)\n\n"
+    f"ℹ️ Limit: {self.settings['queue_limit_per_user']} songs per person\n"
+    f"⏱️ Max duration: {self.settings['max_song_duration']} minutes"
+            )
+            for msg in await self.split_message(music_help_message):
+                await self.send_private_message(user, msg)
+                await asyncio.sleep(0.5)
+
+        elif message.startswith('-play '):
+            try:
+                if self.is_loading:
+                    await self.highrise.chat(random.choice([
+                "🎵 Hold on, I'm tuning the speakers! Try again soon! 🔄",
+                "🎵 Loading the vibe, just a sec! Try again in a bit! ✨",
+                "🎵 Getting the sound ready! Wait a moment and try again! 🎶"
+            ]))
+                    return
+
+                if user_id in self.blocked_users:
+                    await self.highrise.chat(random.choice([
+                f"🚫 @{user.username}, you're blocked from song requests. Contact an admin! 😔",
+                f"🚫 @{user.username}, song requests are blocked for you. Reach out to an admin! 🎵",
+                f"🚫 @{user.username}, you can't request songs now. Talk to the admins! ✨"
+            ]))
+                    return
+
+                parts = message[len('-play '):].strip().split(' ', 1)
+                if len(parts) < 1 or not parts[0]:
+                    await self.highrise.chat(random.choice([
+                "🎶 Oops, you forgot the song! Use: -play <song> or -play @user <song> 🎵",
+                "🎶 Whoa, where's the song? Try: -play <song> or -play @user <song> ✨",
+                "🎶 Hmm, didn't catch that! Type: -play <song> or -play @user <song> 😎"
+            ]))
+                    return
+
+                target_username = None
+                song_request = None
+
+                if parts[0].startswith('@') and len(parts) > 1:
+                    target_username = parts[0][1:]
+                    song_request = parts[1].strip()
+                    if not song_request:
+                        await self.highrise.chat(random.choice([
+                    "🎁 Forgot the song to dedicate! Use: -play @user <song> 🎶",
+                    "🎁 Oops, no song specified! Try: -play @user <song> ✨",
+                    "🎁 Dedication without a song? Type: -play @user <song> 😎"
+                ]))
+                        return
+
+                    room_users = await self.highrise.get_room_users()
+                    target_user = None
+                    for room_user, _ in room_users.content:
+                        if room_user.username.lower() == target_username.lower():
+                            target_user = room_user
+                            target_username = room_user.username
+                            break
+                    if not target_user:
+                        await self.highrise.chat(random.choice([
+                    f"😕 @{target_username} isn't in the room! Try another or just the song! 🎵",
+                    f"😕 Couldn't find @{target_username} here! Pick another or request a song! ✨",
+                    f"😕 @{target_username} is missing! Dedicate to someone else or just the song! 😎"
+                ]))
+                        return
+                else:
+                    song_request = message[len('-play '):].strip()
+
+                if self.user_song_count.get(user.username, 0) >= self.settings["queue_limit_per_user"]:
+                    await self.highrise.chat(random.choice([
+                f"🚧 @{user.username}, you already have {self.settings['queue_limit_per_user']} songs in the queue! Wait for one to play! 🎶",
+                f"🚧 @{user.username}, you've hit the limit of {self.settings['queue_limit_per_user']} songs! Hang tight! ✨",
+                f"🚧 @{user.username}, that's {self.settings['queue_limit_per_user']} requests from you! Hold on, it'll play soon! 😎"
+            ]))
+                    return
+
+                if self.ctoggle and not self.is_vip(user_id):
+                    play_cost = self.settings.get("play_cost", 5)
+                    user_balance = await self.get_user_balance(user.id)
+                    if user_balance < play_cost:
+                        await self.highrise.chat(random.choice([
+                    f"💸 @{user.username}, you need {play_cost} gold to play! Balance: {user_balance}. Try -daily or donate! 🎵",
+                    f"💸 @{user.username}, you're short {play_cost} gold! Balance: {user_balance}. Use -daily or support the bot! ✨",
+                    f"💸 @{user.username}, your {user_balance} gold doesn't cover the {play_cost} needed! Try -daily! 😎"
+                ]))
+                        return
+                    await self.process_play_payment(user, play_cost)
+
+                await self.add_to_queue(song_request, user.username, dedicated_to=target_username)
+    
+            except Exception as e:
+                await self.highrise.chat("❌ An unexpected error occurred during the song request. Please try again.")
+                print(f"Error in -play command: {e}")
+                traceback.print_exc()
+                
+        elif message.startswith("-playfav "):
+            parts = message.split(" ", 1)
+            if len(parts) < 2 or not parts[1].isdigit():
+                await self.highrise.chat(f"▶️ Usage: -playfav <number> (Check with -favorites)")
+                return
+
+            index = int(parts[1]) - 1
+            user_id = user.id
+            if user_id not in self.favorites or index >= len(self.favorites[user_id]["songs"]):
+                await self.highrise.chat(f"📛 @{user.username}, invalid favorite number!")
+                return
+
+            song = self.favorites[user_id]["songs"][index]
+            await self.add_to_queue(song['title'], user.username)
+
+        elif message.startswith("-removefav "):
+            parts = message.split(" ", 1)
+            if len(parts) < 2 or not parts[1].isdigit():
+                await self.highrise.chat(f"🗑 Usage: -removefav <number>")
+                return
+
+            index = int(parts[1]) - 1
+            user_id = user.id
+            if user_id not in self.favorites or index >= len(self.favorites[user_id]["songs"]):
+                await self.highrise.send_whisper(user.id, f"🚫 @{user.username}, no such favorite song at #{index+1}!")
+                return
+
+            removed = self.favorites[user_id]["songs"].pop(index)
+            await self.save_favorites()
+            await self.highrise.send_whisper(user.id, f"🗑 @{user.username}, removed '{removed['title']}' from favorites.")
+
+        elif message.strip() == "-fav":
+            try:
+                if not self.current_song:
+                    await self.highrise.chat(f"🎵 @{user.username}, no song is currently playing!")
+                    return
+
+                song = self.current_song.copy()
+                song_entry = {
+            "title": song["title"],
+            "url": song.get("url", "N/A"),
+            "owner": song.get("owner", "Unknown")
+        }
+
+                user_id = user.id
+                if user_id not in self.favorites:
+                    self.favorites[user_id] = {"username": user.username, "songs": []}
+
+                if any(s["title"].lower() == song_entry["title"].lower() for s in self.favorites[user_id]["songs"]):
+                    await self.highrise.chat(f"⭐ @{user.username}, '{song_entry['title']}' is already in your favorites!")
+                    return
+
+                is_vip = user_id in self.vips.get("vip_users", [])
+                limit = 40 if is_vip else 20
+                if len(self.favorites[user_id]["songs"]) >= limit:
+                    await self.highrise.chat(f"🚫 @{user.username}, you reached your favorite song limit ({limit}). Remove some with `-removefav <number>`.")
+                    return
+
+                self.favorites[user_id]["songs"].append(song_entry)
+                await self.save_favorites()
+                await self.highrise.chat(f"⭐ @{user.username}, added '{song_entry['title']}' to your favorites!")
+
+            except Exception as e:
+                print(f"Error in -fav command: {e}")
+                await self.highrise.chat(f"⚠️ Error: {e}")
+
+        
+        elif message.strip() == "-my fav":
+            user_id = user.id
+            if user_id not in self.favorites or not self.favorites[user_id]["songs"]:
+                await self.highrise.send_whisper(user.id, f"📂 @{user.username}, you don't have any favorite songs yet!")
+                return
+
+            favs = self.favorites[user_id]["songs"]
+            message_chunks = []
+            chunk = f"🎶 [@{user.username}] Favorite Songs:\n"
+
+            for i, song in enumerate(favs, 1):
+                line = f"{i}. {song['title']} by {song.get('owner', 'Unknown')}\n"
+                if len(chunk + line) > 900:
+                    message_chunks.append(chunk.strip())
+                    chunk = line
+                else:
+                    chunk += line
+
+            if chunk.strip():
+                message_chunks.append(chunk.strip())
+
+            for msg in message_chunks:
+                await self.send_private_mes
